@@ -1,25 +1,36 @@
 #include <Bluepad32.h>
 
 // ==========================================
-// 1. IBT_2 MOTOR PINS (RPWM, LPWM)
+// 1. PIN DEFINITIONS (MATCHED TO YOUR WIRING)
 // ==========================================
-#define FL_RPWM 13 //motor 4
-#define FL_LPWM 14
+#define LED_PIN   2   // Onboard ESP32 blue LED (ON = controller connected)
 
-#define FR_RPWM 26 // motor 2
-#define FR_LPWM 27
+// Front Left (FL) -> Motor 4 (Driver 4)
+#define FL_RPWM   23
+#define FL_LPWM   25
+#define FL_EN     33
 
-#define RL_RPWM 32 //motor 3
-#define RL_LPWM 33
+// Front Right (FR) -> Motor 2 (Driver 2)
+#define FR_RPWM   18
+#define FR_LPWM   19
+#define FR_EN     27
 
-#define RR_RPWM 18 //motor 1
-#define RR_LPWM 19
+// Rear Left (RL) -> Motor 3 (Driver 3)
+#define RL_RPWM   21
+#define RL_LPWM   22
+#define RL_EN     32
+
+// Rear Right (RR) -> Motor 1 (Driver 1)
+#define RR_RPWM   16
+#define RR_LPWM   17
+#define RR_EN     26
 
 // ==========================================
 // 2. MOTOR DIRECTION CALIBRATION (1 or -1)
 // ==========================================
-// Hardware polarity is already mirrored between left and right sides,
-// so all four drivers share the same sign.
+// Left/right motors are already mirrored in hardware wiring.
+// Hold D-Pad UP to verify: if ALL 4 spin backward, flip all four to -1.
+// If only one wheel spins backward, flip just that wheel to -1.
 const int FL_DIR = 1;
 const int FR_DIR = 1;
 const int RL_DIR = 1;
@@ -28,41 +39,60 @@ const int RR_DIR = 1;
 // ==========================================
 // 3. TUNING PARAMETERS
 // ==========================================
-const int   DEADZONE     = 40;    // Ignore stick drift (-511 to 512)
-const int   MAX_PWM      = 120;   // Keep at 120 for first test; raise to 220-255 once calibrated
-const float STRAFE_SCALE = 1.1f;  // Boosts sideways speed to offset mecanum roller slip
-const float TURN_SCALE   = 0.85f; // Slightly tames spin sensitivity for robosoccer control
+const int   DEADZONE        = 40;    // Ignore resting stick drift (-511..512)
+const int   MAX_PWM         = 120;   // Start at 120 for bench test; raise to 220-255 once verified
+const float DPAD_SPEED      = 0.75f; // Fixed speed for D-Pad test & emergency backup
+const float EXPO            = 0.4f;  // 0.0 = linear, 0.4 = smoother low-speed stick response
+const float STRAFE_SCALE    = 1.1f;  // Offsets mecanum sideways roller slip
+const float TURN_SCALE      = 0.85f; // Tames rotation sensitivity
+const float PRECISION_SCALE = 0.5f;  // Hold L1 for 50% speed
+
+const int PWM_PINS[8] = {
+  FL_RPWM, FL_LPWM, FR_RPWM, FR_LPWM,
+  RL_RPWM, RL_LPWM, RR_RPWM, RR_LPWM
+};
+
+const int EN_PINS[4] = { FL_EN, FR_EN, RL_EN, RR_EN };
 
 ControllerPtr myController = nullptr;
 
-// Drives a single IBT_2 driver (-1.0 = full reverse, +1.0 = full forward)
+// Enables or disables all four IBT_2 drivers together
+void setDriversEnabled(bool enable) {
+  int state = enable ? HIGH : LOW;
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(EN_PINS[i], state);
+  }
+}
+
+// Drives a single IBT_2 (-1.0 to +1.0) with zero-overlap direction switching
 void setMotor(int rpwmPin, int lpwmPin, float speed, int dirMultiplier) {
   speed = constrain(speed * dirMultiplier, -1.0f, 1.0f);
   int pwmVal = (int)(fabs(speed) * MAX_PWM);
 
-  if (speed > 0.0f) {
+  if (pwmVal == 0) {
+    analogWrite(rpwmPin, 0);
+    analogWrite(lpwmPin, 0);
+  } else if (speed > 0.0f) {
+    analogWrite(lpwmPin, 0);      // Clear opposite channel FIRST
     analogWrite(rpwmPin, pwmVal);
-    analogWrite(lpwmPin, 0);
-  } else if (speed < 0.0f) {
-    analogWrite(rpwmPin, 0);
-    analogWrite(lpwmPin, pwmVal);
   } else {
-    analogWrite(rpwmPin, 0);
-    analogWrite(lpwmPin, 0);
+    analogWrite(rpwmPin, 0);      // Clear opposite channel FIRST
+    analogWrite(lpwmPin, pwmVal);
   }
 }
 
+// Mecanum X-configuration inverse kinematics
+// Forward (+y):      FL+, FR+, RL+, RR+
+// Strafe Left (-x):  FL-, FR+, RL+, RR-
+// Strafe Right (+x): FL+, FR-, RL-, RR+
+// Rotate CW (+rx):   FL+, FR-, RL+, RR-
 void driveMecanum(float y, float x, float rx) {
-  // Core Mecanum X-Configuration Inverse Kinematics
-  // Strafe Left (x = -1)  -> FL(-), FR(+), RL(+), RR(-)
-  // Strafe Right (x = +1) -> FL(+), FR(-), RL(-), RR(+)
-  // Rotate CW (rx = +1)   -> FL(+), FR(-), RL(+), RR(-)
   float fl = y + x + rx;
   float fr = y - x - rx;
   float rl = y - x + rx;
   float rr = y + x - rx;
 
-  // Normalize all 4 wheels proportionally so combined moves stay <= 1.0
+  // Proportional normalization so combined moves stay within -1.0..1.0
   float maxMag = max(max(fabs(fl), fabs(fr)), max(fabs(rl), fabs(rr)));
   if (maxMag > 1.0f) {
     fl /= maxMag;
@@ -77,66 +107,108 @@ void driveMecanum(float y, float x, float rx) {
   setMotor(RR_RPWM, RR_LPWM, rr, RR_DIR);
 }
 
-void stopAllMotors() {
+// Hard failsafe: zeroes all PWMs AND disables all four H-bridges
+void disableAllMotors() {
   driveMecanum(0.0f, 0.0f, 0.0f);
+  setDriversEnabled(false);
+}
+
+// Smooth deadzone rescaling + expo curve (-511..512 -> -1.0..1.0)
+float tuneStick(int raw) {
+  if (abs(raw) <= DEADZONE) return 0.0f;
+
+  float sign = (raw > 0) ? 1.0f : -1.0f;
+  float mag  = (abs(raw) - DEADZONE) / (512.0f - DEADZONE);
+  mag = constrain(mag, 0.0f, 1.0f);
+
+  float curved = (1.0f - EXPO) * mag + EXPO * (mag * mag);
+  return sign * curved;
 }
 
 void onConnectedController(ControllerPtr ctl) {
   if (myController == nullptr) {
-    Serial.println("PS4 Controller Connected!");
     myController = ctl;
+    driveMecanum(0.0f, 0.0f, 0.0f); // Guarantee 0 PWM before enabling
+    setDriversEnabled(true);        // Pull all 4 R_EN/L_EN pins HIGH
+    digitalWrite(LED_PIN, HIGH);
     ctl->setColorLED(0, 255, 0);
+    Serial.println("PS4 Connected - All 4 Drivers ENABLED.");
   }
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
   if (myController == ctl) {
-    Serial.println("Controller Disconnected - Failsafe Stop!");
     myController = nullptr;
-    stopAllMotors();
+    disableAllMotors();             // Zero PWM + pull all 4 EN pins LOW
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("PS4 Disconnected - All 4 Drivers DISABLED.");
   }
 }
 
 void processGamepad(ControllerPtr ctl) {
-  uint8_t dpad = ctl->dpad();
+  float scale = ctl->l1() ? PRECISION_SCALE : 1.0f;
 
-  // D-Pad Pure-Direction Mode (great for verifying wheel directions)
+  // ------------------------------------------
+  // 1. D-PAD CHECK FIRST (Bench Test & Emergency Backup)
+  // Overrides both sticks whenever any D-Pad button is held.
+  // L2 / R2 provide emergency CCW / CW rotation while using D-Pad.
+  // ------------------------------------------
+  uint8_t dpad = ctl->dpad();
   if (dpad != 0) {
-    float testY = 0.0f;
-    float testX = 0.0f;
-    if (dpad & DPAD_UP)    testY =  0.7f; // All 4 forward
-    if (dpad & DPAD_DOWN)  testY = -0.7f; // All 4 backward
-    if (dpad & DPAD_LEFT)  testX = -0.7f; // FL-, FR+, RL+, RR-
-    if (dpad & DPAD_RIGHT) testX =  0.7f; // FL+, FR-, RL-, RR+
-    driveMecanum(testY, testX, 0.0f);
+    float dy  = 0.0f;
+    float dx  = 0.0f;
+    float drx = 0.0f;
+
+    if (dpad & DPAD_UP)    dy  += DPAD_SPEED;
+    if (dpad & DPAD_DOWN)  dy  -= DPAD_SPEED;
+    if (dpad & DPAD_RIGHT) dx  += DPAD_SPEED;
+    if (dpad & DPAD_LEFT)  dx  -= DPAD_SPEED;
+    if (ctl->r2())         drx += DPAD_SPEED * TURN_SCALE;
+    if (ctl->l2())         drx -= DPAD_SPEED * TURN_SCALE;
+
+    driveMecanum(dy * scale, dx * scale, drx * scale);
     return;
   }
 
-  // Analog Joystick Holonomic Control
-  int rawY  = -ctl->axisY();   // Left Stick Up = Forward (+)
-  int rawX  =  ctl->axisX();   // Left Stick Right = Strafe Right (+)
-  int rawRX =  ctl->axisRX();  // Right Stick Right = Rotate CW (+)
+  // ------------------------------------------
+  // 2. ANALOG JOYSTICK CONTROL (Normal Driving)
+  // ------------------------------------------
+  float y  = tuneStick(-ctl->axisY());                 // Left Stick Up (+) / Down (-)
+  float x  = tuneStick( ctl->axisX())  * STRAFE_SCALE; // Left Stick Right (+) / Left (-)
+  float rx = tuneStick( ctl->axisRX()) * TURN_SCALE;   // Right Stick Right/CW (+) / Left/CCW (-)
 
-  float y  = (abs(rawY)  > DEADZONE) ? (rawY  / 512.0f) : 0.0f;
-  float x  = (abs(rawX)  > DEADZONE) ? (rawX  / 512.0f) * STRAFE_SCALE : 0.0f;
-  float rx = (abs(rawRX) > DEADZONE) ? (rawRX / 512.0f) * TURN_SCALE   : 0.0f;
+  // Emergency standalone rotation with L2/R2 if right stick is dead/centered
+  if (rx == 0.0f) {
+    if (ctl->r2()) rx =  DPAD_SPEED * TURN_SCALE;
+    if (ctl->l2()) rx = -DPAD_SPEED * TURN_SCALE;
+  }
 
-  driveMecanum(y, x, rx);
+  driveMecanum(y * scale, x * scale, rx * scale);
 }
 
 void setup() {
   Serial.begin(115200);
 
-  int pins[] = {FL_RPWM, FL_LPWM, FR_RPWM, FR_LPWM, RL_RPWM, RL_LPWM, RR_RPWM, RR_LPWM};
-  for (int i = 0; i < 8; i++) {
-    pinMode(pins[i], OUTPUT);
-    analogWrite(pins[i], 0);
+  // Preset all 4 Enable pins LOW before setting OUTPUT (prevents boot twitch)
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(EN_PINS[i], LOW);
+    pinMode(EN_PINS[i], OUTPUT);
   }
+
+  // Preset all 8 PWM pins LOW before attaching PWM
+  for (int i = 0; i < 8; i++) {
+    digitalWrite(PWM_PINS[i], LOW);
+    pinMode(PWM_PINS[i], OUTPUT);
+    analogWrite(PWM_PINS[i], 0);
+  }
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   BP32.setup(&onConnectedController, &onDisconnectedController);
   BP32.enableVirtualDevice(false);
 
-  Serial.println("Mecanum Bluepad32 Ready. Pair PS4 controller (Share + PS).");
+  Serial.println("Mecanum Bot Ready. Drivers DISABLED until PS4 connects.");
 }
 
 void loop() {
@@ -147,7 +219,7 @@ void loop() {
       processGamepad(myController);
     }
   } else if (myController == nullptr || !myController->isConnected()) {
-    stopAllMotors();
+    disableAllMotors();
   }
 
   vTaskDelay(1);
